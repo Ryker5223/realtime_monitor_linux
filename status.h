@@ -44,7 +44,7 @@ unsigned long get_uptime(void);
 /*
  * 检查摄像头设备是否存在
  */
-int camera_is_online(const char *device);
+int camera_is_online(const char *device, int v4l2_fd);
 
 
 /*
@@ -53,7 +53,7 @@ int camera_is_online(const char *device);
 int get_device_status(
     device_status_t *status,
     float fps,
-    int streaming
+    int v4l2_fd
 );
 
 

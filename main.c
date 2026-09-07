@@ -889,7 +889,7 @@ static void *status_thread(void *arg)
 
         float now_fps = fps;
 
-        if (get_device_status(&status, now_fps) < 0)
+        if (get_device_status(&status, now_fps, v4l2_fd) < 0)
         {
             fprintf(stderr,
             "get device status failed\n");
@@ -914,6 +914,7 @@ static void *status_thread(void *arg)
             continue;
         }
     }
+    return NULL;
 }
 
 

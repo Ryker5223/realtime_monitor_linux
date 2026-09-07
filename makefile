@@ -1,37 +1,45 @@
-CROSS = /opt/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+CROSS_COMPILE := /opt/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+CC := $(CROSS_COMPILE)gcc
 
-CC = $(CROSS)gcc
+TARGET := video_rtmp
 
-TARGET = video_rtmp
+SRCS := main.c \
+        rtmp_push.c \
+        http.c \
+        status.c
 
-SRCS = main.c rtmp_push.c
-OBJS = $(SRCS:.c=.o)
+OBJS := $(SRCS:.c=.o)
+DEPS := $(OBJS:.o=.d)
 
-FFMPEG_SRC = /home/liu/ffmpeg-3.0
-FFMPEG_LIB = /home/liu/imx6ull_ffmpeg/lib
+FFMPEG_SRC := /home/liu/ffmpeg-3.0
+FFMPEG_LIB := /home/liu/imx6ull_ffmpeg/lib
 
-CFLAGS = -Wall -O2 \
-         -I$(FFMPEG_SRC)
+CPPFLAGS := -I$(FFMPEG_SRC)
+CFLAGS := -Wall -O2 -MMD -MP
 
-LDFLAGS = -L$(FFMPEG_LIB) \
-          -Wl,-rpath-link,$(FFMPEG_LIB)
+LDFLAGS := -L$(FFMPEG_LIB) \
+           -Wl,-rpath-link,$(FFMPEG_LIB)
 
-LIBS = -lavformat \
-       -lavcodec \
-       -lavutil \
-       -lswscale \
-       -lswresample \
-       -lpthread \
-       -lm \
-       -ldl
+LDLIBS := -lavformat \
+          -lavcodec \
+          -lavutil \
+          -lswscale \
+          -lswresample \
+          -lpthread \
+          -lm \
+          -ldl
+
+.PHONY: all clean
+
+all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) -o $@ $(OBJS) $(LDFLAGS) $(LIBS)
+	$(CC) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(DEPS) $(TARGET)
 
-.PHONY: clean
+-include $(DEPS)
