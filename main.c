@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "rtmp_push.h"
 #include "status.h"
@@ -27,6 +28,13 @@
 #define MAX_FORMAT_COUNT 10      // 最多保存 10 种摄像头像素格式
 #define SAVE_PATH "/mnt/frame.rgb565"
 #define PORT 8888  // 本机 tcp 服务端端口
+
+#define RTMP_URL "rtmp://106.14.2.164/live/cam1"
+#define RTMP_FPS 15
+#define RECONNECT_MAX_SEC 8
+
+#define CAMERA_WIDTH  480
+#define CAMERA_HEIGHT 272
 
 static int v4l2_fd = -1;
 static int fb_fd = -1;
@@ -52,6 +60,10 @@ typedef struct
     unsigned char *data;
     size_t size;
     unsigned long frame_id;
+
+    /* 当前视频帧的采集时间，单位 us */
+    int64_t capture_us;
+
     int stop;               // 通知线程是否退出，因为多线程程序里，一个线程可能一直运行：while(1)
     pthread_mutex_t mutex;  // mutex 和 cond 用于互斥锁
     pthread_cond_t cond;
@@ -62,9 +74,9 @@ typedef struct
 static latest_frame_t latest_frame;
 
 /* LCD 信息 */
-static int width;                    // LCD 宽度
-static int height;                   // LCD 高度
-static int fb_line_length;           // LCD 每行占用的字节数
+// static int width;                    // LCD 宽度
+// static int height;                   // LCD 高度
+// static int fb_line_length;           // LCD 每行占用的字节数
 
 static unsigned short *screen_base;  // LCD 显存基地址, 指向两个字节的short类型的数据
 static unsigned long screen_size;    // LCD 显存大小
@@ -80,6 +92,45 @@ static unsigned int buf_count = 0;
 /* 摄像头支持的格式 */
 static cam_fmt cam_fmts[MAX_FORMAT_COUNT];
 static int cam_fmt_count = 0;
+
+
+
+
+/* 获取 CLOCK_MONOTONIC 时间，单位 us */
+static int64_t get_monotonic_us(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return -1;
+
+    return (int64_t)ts.tv_sec * 1000000LL +
+           ts.tv_nsec / 1000;
+    // LL 表示这个整数常量是 long long 类型
+    // 而在音视频同步中，我们通常希望统一使用微秒作为时间单位，方便计算时间差。
+}
+
+/*
+ * 获取 V4L2 视频帧时间戳。
+ * 如果驱动提供 MONOTONIC 时间戳，优先使用。
+ * 否则使用 DQBUF 返回后的单调时钟时间。
+ */
+static int64_t get_v4l2_timestamp_us(
+    const struct v4l2_buffer *buf)
+{
+    /* 判断摄像头驱动提供的时间戳是否基于单调时钟（CLOCK_MONOTONIC） */
+    if ((buf->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+        V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC &&
+        (buf->timestamp.tv_sec != 0 ||
+         buf->timestamp.tv_usec != 0))
+    {
+        return (int64_t)buf->timestamp.tv_sec * 1000000LL +
+               buf->timestamp.tv_usec;
+    }
+
+    return get_monotonic_us();
+}
+
 
 /* 初始化 last frame */
 static int latest_frame_init(void)
@@ -168,7 +219,8 @@ static int v4l2_dev_init(const char *device)
         v4l2_fd = -1;
         return -1;
     }
-    // 某些较新的驱动使用 device_caps 保存真正的设备能力
+    // 某些较新的驱动使用 device_caps 保存真正的设备能力，
+    // & 按位与运算符，用于判断 cap.capabilities 中是否设置了 V4L2_CAP_DEVICE_CAPS 标志位
     if (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
         capabilities = cap.device_caps;
     else
@@ -200,75 +252,75 @@ static int v4l2_dev_init(const char *device)
 }
 
 /* 初始化LCD framebuffer */
-static int fb_dev_init(void)
-{
-    struct fb_var_screeninfo fb_var = {0};
-    struct fb_fix_screeninfo fb_fix = {0};
+// static int fb_dev_init(void)
+// {
+//     struct fb_var_screeninfo fb_var = {0};
+//     struct fb_fix_screeninfo fb_fix = {0};
 
-    fb_fd = open(FB_DEV, O_RDWR);
-    if (fb_fd < 0)
-    {
-        fprintf(stderr, "open fb error: %s", strerror(errno));
-        return -1;
-    }
+//     fb_fd = open(FB_DEV, O_RDWR);
+//     if (fb_fd < 0)
+//     {
+//         fprintf(stderr, "open fb error: %s", strerror(errno));
+//         return -1;
+//     }
 
-    // 获取 framebuffer 可变参数
-    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, & fb_var) < 0)
-    {
-        perror("ioctl FBIOGET_VSCREENINFO");
-        close(fb_fd);
-        fb_fd = -1;
-        return -1;
-    }
+//     // 获取 framebuffer 可变参数
+//     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, & fb_var) < 0)
+//     {
+//         perror("ioctl FBIOGET_VSCREENINFO");
+//         close(fb_fd);
+//         fb_fd = -1;
+//         return -1;
+//     }
 
-    // 获取 framebuffer 固定参数
-    if (ioctl(fb_fd, FBIOGET_FSCREENINFO, & fb_fix) < 0)
-    {
-        perror("ioctl FBIOGET_FSCREENINFO");
-        close(fb_fd);
-        fb_fd = -1;
-        return -1;
-    }
+//     // 获取 framebuffer 固定参数
+//     if (ioctl(fb_fd, FBIOGET_FSCREENINFO, & fb_fix) < 0)
+//     {
+//         perror("ioctl FBIOGET_FSCREENINFO");
+//         close(fb_fd);
+//         fb_fd = -1;
+//         return -1;
+//     }
 
-    width = fb_var.xres;
-    height = fb_var.yres;
-    fb_line_length = fb_fix.line_length;
+//     width = fb_var.xres;
+//     height = fb_var.yres;
+//     fb_line_length = fb_fix.line_length;
 
-    screen_size = fb_fix.line_length * fb_var.yres;
+//     screen_size = fb_fix.line_length * fb_var.yres;
 
-    printf("LCD resolution: %d x %d\n", width, height);
-    printf("bits_per_pixel: %d\n", fb_var.bits_per_pixel);
-    printf("line_length: %d bytes\n", fb_line_length);
+//     printf("LCD resolution: %d x %d\n", width, height);
+//     printf("bits_per_pixel: %d\n", fb_var.bits_per_pixel);
+//     printf("line_length: %d bytes\n", fb_line_length);
 
-    /*
-     * 下面代码直接把 RGB565 摄像头数据复制给 LCD，
-     * 因此要求 framebuffer 是 16bit。
-     */
-     if (fb_var.bits_per_pixel != 16)
-     {
-        fprintf(stderr, "error: framebuffer is not 16-bit RGB565!\n");
-        close(fb_fd);
-        fb_fd = -1;
-        return -1;
-     }
+//     /*
+//      * 下面代码直接把 RGB565 摄像头数据复制给 LCD，
+//      * 因此要求 framebuffer 是 16 bit。
+//      */
+//      if (fb_var.bits_per_pixel != 16)
+//      {
+//         fprintf(stderr, "error: framebuffer is not 16-bit RGB565!\n");
+//         close(fb_fd);
+//         fb_fd = -1;
+//         return -1;
+//      }
 
-     // 将 LCD 显存映射到用户空间
-     screen_base = mmap(NULL, screen_size, PROT_READ|PROT_WRITE, MAP_SHARED, fb_fd, 0);
+//      // 将 LCD 显存映射到用户空间
+//      screen_base = mmap(NULL, screen_size, PROT_READ|PROT_WRITE, MAP_SHARED, fb_fd, 0);
 
-     if (screen_base == MAP_FAILED)
-     {
-        perror("mmap framebuffer:");
-        close(fb_fd);
-        fb_fd = -1;
-        return -1;
-     }
+//      if (screen_base == MAP_FAILED)
+//      {
+//         perror("mmap framebuffer:");
+//         close(fb_fd);
+//         fb_fd = -1;
+//         return -1;
+//      }
 
-     // LCD 背景刷白
-     memset(screen_base, 0xFF, screen_size);
+//      // LCD 背景刷白
+//      memset(screen_base, 0xFF, screen_size);
 
-     return 0;
+//      return 0;
 
-}
+// }
 
 
 /* 枚举摄像头支持的像素格式 */
@@ -311,6 +363,7 @@ static void v4l2_print_formats(void)
         struct v4l2_frmsizeenum frmsize = {0};
         printf("------------------------------------\n");
 
+        // 只保留 8 位
         printf("format<%c%c%c%c>, description<%s>\n",
                 cam_fmts[i].pixelformat & 0xFF,
                 (cam_fmts[i].pixelformat >> 8) & 0xFF,
@@ -318,7 +371,7 @@ static void v4l2_print_formats(void)
                 (cam_fmts[i].pixelformat >> 24) & 0xFF,
                 cam_fmts[i].description);
         
-        // 枚举像素格式支持的所以分辨率
+        // 枚举像素格式支持的所有分辨率
         frmsize.pixel_format = cam_fmts[i].pixelformat;
 
         for (frmsize.index = 0; ; frmsize.index++)
@@ -330,8 +383,8 @@ static void v4l2_print_formats(void)
 
             /*
              * 普通摄像头通常返回离散分辨率
-                这里的 frmsize.type 不应该由你设置，它是 VIDIOC_ENUM_FRAMESIZES 调用成功后由驱动返回给你的
-             */
+               这里的 frmsize.type 不应该由你设置，它是 VIDIOC_ENUM_FRAMESIZES 调用成功后由驱动返回给你的
+            */
              if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
              {
                 struct v4l2_frmivalenum frmival = {0};
@@ -378,8 +431,8 @@ static void v4l2_print_formats(void)
     */
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-    fmt.fmt.pix.width = width;
-    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.width = CAMERA_WIDTH;
+    fmt.fmt.pix.height = CAMERA_HEIGHT;
 
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
     fmt.fmt.pix.field = V4L2_FIELD_ANY;
@@ -438,7 +491,7 @@ static void v4l2_print_formats(void)
     if (streamparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)
     {
         streamparm.parm.capture.timeperframe.numerator = 1;
-        streamparm.parm.capture.timeperframe.denominator = 30;
+        streamparm.parm.capture.timeperframe.denominator = RTMP_FPS;
 
         if (ioctl(v4l2_fd, VIDIOC_S_PARM, &streamparm) < 0)
         {
@@ -592,27 +645,32 @@ static int v4l2_stream_off(void)
  */
 static void *capture_lcd_thread(void *arg)
 {
+    // struct v4l2_buffer buf;
+    // struct pollfd fds[1];
+
+    // int min_w;
+    // int min_h;
+    // int lcd_stride;
+
+    // (void)arg;
+
     struct v4l2_buffer buf;
     struct pollfd fds[1];
-
-    int min_w;
-    int min_h;
-    int lcd_stride;
 
     (void)arg;
 
     // ========================================================
     // LCD显示范围
     // ========================================================
-    if (width > frm_width)
-        min_w = frm_width;
-    else
-        min_w = width;
-    if (height > frm_height)
-        min_h = frm_height;
-    else
-        min_h = height;
-    lcd_stride = fb_line_length / 2;
+    // if (width > frm_width)
+    //     min_w = frm_width;
+    // else
+    //     min_w = width;
+    // if (height > frm_height)
+    //     min_h = frm_height;
+    // else
+    //     min_h = height;
+    // lcd_stride = fb_line_length / 2;
 
     // ========================================================
     // poll
@@ -699,6 +757,18 @@ static void *capture_lcd_thread(void *arg)
         }
 
 
+
+        /* 记录当前视频帧的采集时间 */
+        int64_t capture_us = get_v4l2_timestamp_us(&buf);
+
+        if (capture_us < 0)
+        {
+            ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+            fprintf(stderr, "Get video timestamp failed\n");
+            break;
+        }
+
+
         if (buf.index >= buf_count)
         {
             fprintf(stderr, "Invalid buffer index\n");
@@ -721,16 +791,16 @@ static void *capture_lcd_thread(void *arg)
 
         pthread_mutex_lock(&latest_frame.mutex);
 
+        /* 保存图像数据 */
         memcpy(latest_frame.data, start, frame_size);
 
+        /* 保存帧编号 */
         latest_frame.frame_id++;
 
-        /*
-         * 通知 线程：
-         * 有新帧。
-         */
+        /* 保存对应的采集时间 */
+        latest_frame.capture_us = capture_us;
 
-         // 唤醒至少一个正在等待 latest_frame.cond 条件变量的线程。
+        /* 通知 FFmpeg 线程 */
         pthread_cond_signal(&latest_frame.cond);
 
         pthread_mutex_unlock(&latest_frame.mutex);
@@ -757,20 +827,20 @@ static void *capture_lcd_thread(void *arg)
         // 下一次覆盖发生在下一轮采集，因此当前显示安全。
         // ====================================================
 
-        unsigned short *base = screen_base;
+        // unsigned short *base = screen_base;
 
-        unsigned short *lcd_src = (unsigned short *)latest_frame.data;
+        // unsigned short *lcd_src = (unsigned short *)latest_frame.data;
 
-        int j;
+        // int j;
 
-        for (j = 0; j < min_h; j++)
-        {
-            memcpy(base, lcd_src, min_w * 2);
+        // for (j = 0; j < min_h; j++)
+        // {
+        //     memcpy(base, lcd_src, min_w * 2);
 
-            base += lcd_stride;
+        //     base += lcd_stride;
 
-            lcd_src += frm_width;
-        }
+        //     lcd_src += frm_width;
+        // }
 
     }
 
@@ -778,6 +848,17 @@ static void *capture_lcd_thread(void *arg)
     request_stop();
 
     return NULL;
+}
+
+static int is_stop_requested(void)
+{
+    int stop;
+
+    pthread_mutex_lock(&latest_frame.mutex);
+    stop = latest_frame.stop;
+    pthread_mutex_unlock(&latest_frame.mutex);
+
+    return stop;
 }
 
 
@@ -791,6 +872,8 @@ static void *ffmpeg_thread(void *arg)
     unsigned char *frame_copy;
 
     (void)arg;
+
+    int64_t frame_capture_us = 0;
 
     frame_size = frm_height * frm_width * 2;
 
@@ -814,11 +897,18 @@ static void *ffmpeg_thread(void *arg)
     /*
     * 初始化 FFmpeg + RTMP
     */
-    if (rtmp_init("rtmp://106.14.2.164/live/cam1", frm_width, frm_height, 10) < 0)
+
+    if (rtmp_init(RTMP_URL, frm_width, frm_height, RTMP_FPS) < 0)
     {
         fprintf(stderr, "rtmp_init failed\n");
-        free(frame_copy);
+
+        /* 通知其他线程停止 */
         request_stop();
+
+        /* 释放视频帧缓存 */
+        free(frame_copy);
+        frame_copy = NULL;
+
         return NULL;
     }
 
@@ -843,8 +933,10 @@ static void *ffmpeg_thread(void *arg)
             break;
         }
 
-        /* 拷贝最新帧， 还必须持有 mutex, 防止采集线程修改 */
         memcpy(frame_copy, latest_frame.data, frame_size);
+
+        /* 获取当前图像对应的采集时间 */
+        frame_capture_us = latest_frame.capture_us;
 
         last_frame_id = latest_frame.frame_id;
 
@@ -854,11 +946,29 @@ static void *ffmpeg_thread(void *arg)
         /*
         * ffmpeg 编码 + RTMP， 使用frame_copy的数据，不再访问latest_frame
         */
-        if (rtmp_push_frame(frame_copy, frm_width * 2) < 0)
-        {
-            fprintf(stderr, "rtmp_push frame failed\n");
-            request_stop();
-            break;
+        if (rtmp_push_frame(frame_copy, frm_width * 2, frame_capture_us) < 0){
+            fprintf(stderr, "RTMP disconnected!\n");
+
+            rtmp_abort();  // 异常关闭 RTMP，释放资源
+
+            sleep(3);      // 等待 3 秒
+
+            while (!is_stop_requested()) {
+
+                if (rtmp_init(
+                        "rtmp://106.14.2.164/live/cam1",
+                        frm_width,
+                        frm_height,
+                        RTMP_FPS) == 0) 
+                {
+
+                    printf("RTMP reconnected!\n");
+                    break;
+                }
+
+                rtmp_abort();  // 清理失败的初始化
+                sleep(3);
+            }
         }
     }
 
@@ -910,9 +1020,9 @@ static void *status_thread(void *arg)
         if (send_status_http("106.14.2.164", 80, path, json) < 0)
         {
             printf("send http failed\n");
-            sleep(2);
             continue;
         }
+        sleep(2);
     }
     return NULL;
 }
@@ -976,11 +1086,11 @@ int main(int argc, char *argv[])
     /*
      * 初始化 LCD
      */
-    if (fb_dev_init() < 0)
-    {
-        cleanup();
-        exit(EXIT_FAILURE);
-    }
+    // if (fb_dev_init() < 0)
+    // {
+    //     cleanup();
+    //     exit(EXIT_FAILURE);
+    // }
 
     /*
      * 初始化摄像头

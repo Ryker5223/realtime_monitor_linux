@@ -1,2 +1,13 @@
+# VS Code
+.vscode/
+
+# 编译文件
 *.o
-*.d
+
+# 可执行程序
+video_rtmp
+test_folder/audio
+test_folder/audio_encoder
+
+# 临时文件
+*.log

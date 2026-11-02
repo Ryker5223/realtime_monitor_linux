@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+
+void rtmp_abort(void);
+
+
 /*
  * 初始化 RTMP 推流
  *
@@ -15,10 +19,7 @@
  * fps:
  *   帧率
  */
-int rtmp_init(const char *url,
-              int width,
-              int height,
-              int fps);
+int rtmp_init(const char *url, int width, int height, int fps);
 
 
 /*
@@ -33,8 +34,11 @@ int rtmp_init(const char *url,
  * RGB565 通常：
  *   stride = width * 2
  */
-int rtmp_push_frame(const uint8_t *data, int stride);
-
+int rtmp_push_frame(
+    const uint8_t *data,
+    int stride,
+    int64_t capture_us
+);
 
 /*
  * 结束推流并释放资源

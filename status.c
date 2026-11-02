@@ -74,7 +74,7 @@ float get_cpu_usage(void)
     if (read_cpu_stat(&s1) < 0)
         return -1.0f;
 
-    usleep(200000);
+    usleep(1000000);
 
     if (read_cpu_stat(&s2) < 0)
         return -1.0f;
